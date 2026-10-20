@@ -102,7 +102,18 @@ The `identity-oracle`, `credit-oracle`, and `revocation-registry` contracts emit
 
 - **Topic:** `[Symbol("Score")]`
 - **Data:** `(subject: Address, score: u32)`
-- **Emitted When:** A subject's credit score is recomputed and updated.
+- **Emitted When:** A subject's score is computed along the normal `compute_score` path.
+- **Behavior:** This event remains emitted for every completed normal computation, even if the stored score record does not change. Its topic and payload are unchanged whether verbose events are enabled or disabled. `score` is the final score returned by `compute_score`.
+
+#### ScoreDetail
+
+- **Topic:** `[Symbol("ScoreDetail")]`
+- **Data:** `(subject: Address, vc_score: u32, tx_score: u32, repay_score: u32, composite: u32, weights: ScoringWeights)`
+- **`weights`:** `ScoringWeights { vc_weight: u32, tx_weight: u32, repayment_weight: u32 }`, containing the active weights used for this score computation.
+- **`composite`:** The weighted component average before conversion to the final score. The final score is computed from this composite using the existing score formula.
+- **Emitted When:** An administrator has enabled verbose events and `compute_score` computes a score. This event is emitted in addition to `Score`; it does not replace it.
+- **Configuration:** Administrators call `set_verbose_events(admin, enabled)` to enable or disable the event. `get_verbose_events()` returns the current setting. The setting defaults to `false`, so consumers should not expect `ScoreDetail` unless verbose events have been enabled.
+- **Analytics Use:** Consumers can combine the component scores with the emitted active weights to inspect each component's contribution to the weighted composite. The included weights identify the configuration used for that individual computation.
 
 #### FdrReg / FdrDeReg
 

@@ -95,6 +95,8 @@ pub enum DataKey {
     /// Written by `accept_admin` when the accepting address is a contract and
     /// removed when an account address accepts. Read via `get_governance`.
     GovernanceId,
+    /// Whether `compute_score` emits component breakdown events.
+    VerboseEvents,
 }
 
 /// Basis-point denominator: 10_000 bps == 1.00x multiplier.
@@ -185,6 +187,32 @@ pub fn compute_score_pure(
     tx_weight: u32,
     repayment_weight: u32,
 ) -> u32 {
+    compute_score_components(
+        vc_points,
+        volume_30d,
+        avg_counterparties,
+        on_time_count,
+        total_count,
+        total_repaid,
+        vc_weight,
+        tx_weight,
+        repayment_weight,
+    )
+    .4
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_score_components(
+    vc_points: u32,
+    volume_30d: i128,
+    avg_counterparties: u32,
+    on_time_count: u32,
+    total_count: u32,
+    total_repaid: i128,
+    vc_weight: u32,
+    tx_weight: u32,
+    repayment_weight: u32,
+) -> (u32, u32, u32, u32, u32) {
     let vc_score = (vc_points).min(100) as u128;
     let volume_score = ((volume_30d / 100_000_000i128).max(0) as u128).min(80);
     let counterparty_bonus = (avg_counterparties / 5).min(20) as u128;
@@ -201,7 +229,13 @@ pub fn compute_score_pure(
         + repay_score * repayment_weight as u128)
         / 100;
     let score = MIN_SCORE as u128 + composite.saturating_mul(550) / 100;
-    score.min(MAX_SCORE as u128).max(MIN_SCORE as u128) as u32
+    (
+        vc_score as u32,
+        tx_score as u32,
+        repay_score as u32,
+        composite as u32,
+        score.min(MAX_SCORE as u128).max(MIN_SCORE as u128) as u32,
+    )
 }
 
 /// Number of ledgers after which a score is considered stale.
@@ -464,6 +498,35 @@ impl CreditOracle {
     pub fn get_compute_cooldown_ledgers(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::ComputeCooldownLedgers)
             .unwrap_or(DEFAULT_COMPUTE_COOLDOWN_LEDGERS)
+    }
+
+    /// Enable or disable component breakdown events. Admin only.
+    pub fn set_verbose_events(
+        env: Env,
+        admin: Address,
+        enabled: bool,
+    ) -> Result<(), CreditOracleError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        if admin != stored_admin {
+            return Err(CreditOracleError::NotAuthorized);
+        }
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::VerboseEvents, &enabled);
+        Ok(())
+    }
+
+    /// Return whether component breakdown events are enabled (default: false).
+    pub fn get_verbose_events(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::VerboseEvents)
+            .unwrap_or(false)
     }
 
     /// Update the compute-score cooldown. Admin only.
@@ -1199,7 +1262,7 @@ impl CreditOracle {
             .get(&DataKey::Config)
             .ok_or(CreditOracleError::NotInitialized)?;
 
-        let score = compute_score_pure(
+        let (vc_score, tx_score, repay_score, composite, score) = compute_score_components(
             vc_points,
             tx_stats.volume_30d,
             tx_stats.avg_counterparties,
@@ -1268,6 +1331,20 @@ impl CreditOracle {
 
         env.events()
             .publish((symbol_short!("Score"),), (subject.clone(), score));
+
+        if Self::get_verbose_events(env.clone()) {
+            env.events().publish(
+                (Symbol::new(&env, "ScoreDetail"),),
+                (
+                    subject,
+                    vc_score,
+                    tx_score,
+                    repay_score,
+                    composite,
+                    weights,
+                ),
+            );
+        }
 
         Ok(score)
     }
@@ -2082,6 +2159,102 @@ mod tests {
         assert_eq!(score, MIN_SCORE);
     }
 
+    fn count_events(env: &Env, contract_id: &Address, name: &str) -> u32 {
+        let events = env.events().all();
+        let expected_topic = Symbol::new(env, name);
+        events
+            .iter()
+            .filter(|(event_contract_id, topics, _)| {
+                if event_contract_id != contract_id || topics.len() != 1 {
+                    return false;
+                }
+                let topic: Symbol = topics
+                    .get(0)
+                    .unwrap()
+                    .try_into_val(env)
+                    .expect("topic should be a Symbol");
+                topic == expected_topic
+            })
+            .count() as u32
+    }
+
+    fn assert_score_event(
+        env: &Env,
+        contract_id: &Address,
+        expected_subject: &Address,
+        expected_score: u32,
+    ) {
+        let events = env.events().all();
+        let expected_topic = symbol_short!("Score");
+        let mut score_count = 0;
+        for (event_contract_id, topics, data) in events.iter() {
+            if event_contract_id != *contract_id || topics.len() != 1 {
+                continue;
+            }
+            let topic: Symbol = topics
+                .get(0)
+                .unwrap()
+                .try_into_val(env)
+                .expect("topic should be a Symbol");
+            if topic != expected_topic {
+                continue;
+            }
+            let (subject, score): (Address, u32) = data
+                .try_into_val(env)
+                .expect("Score data should be (Address, u32)");
+            assert_eq!(subject, *expected_subject);
+            assert_eq!(score, expected_score);
+            score_count += 1;
+        }
+        assert_eq!(score_count, 1, "expected exactly one unchanged Score event");
+    }
+
+    fn assert_score_detail_event(
+        env: &Env,
+        contract_id: &Address,
+        expected_subject: &Address,
+        expected_vc_score: u32,
+        expected_tx_score: u32,
+        expected_repay_score: u32,
+        expected_composite: u32,
+        expected_weights: ScoringWeights,
+    ) {
+        let events = env.events().all();
+        let expected_topic = Symbol::new(env, "ScoreDetail");
+        let mut detail_count = 0;
+        for (event_contract_id, topics, data) in events.iter() {
+            if event_contract_id != *contract_id || topics.len() != 1 {
+                continue;
+            }
+            let topic: Symbol = topics
+                .get(0)
+                .unwrap()
+                .try_into_val(env)
+                .expect("topic should be a Symbol");
+            if topic != expected_topic {
+                continue;
+            }
+            let (subject, vc_score, tx_score, repay_score, composite, weights): (
+                Address,
+                u32,
+                u32,
+                u32,
+                u32,
+                ScoringWeights,
+            ) = data
+                .try_into_val(env)
+                .expect("ScoreDetail data should include the component scores and weights");
+            assert_eq!(subject, *expected_subject);
+            assert_eq!(vc_score, expected_vc_score);
+            assert_eq!(tx_score, expected_tx_score);
+            assert_eq!(repay_score, expected_repay_score);
+            assert_eq!(composite, expected_composite);
+            assert_eq!(weights, expected_weights);
+            detail_count += 1;
+        }
+        assert_eq!(detail_count, 1, "expected exactly one ScoreDetail event");
+    }
+
     #[test]
     fn test_compute_score_emits_score_event() {
         let env = Env::default();
@@ -2096,31 +2269,132 @@ mod tests {
         // Compute the score which should emit a Score event
         let score = client.compute_score(&subject);
 
-        // Retrieve all emitted events
-        let events = env.events().all();
+        assert_score_event(&env, &contract_id, &subject, score);
+        assert_eq!(count_events(&env, &contract_id, "ScoreDetail"), 0);
+    }
 
-        // Should be exactly one event (the Score event)
-        assert_eq!(events.len(), 1, "expected exactly one event");
+    #[test]
+    fn test_compute_score_emits_detail_when_verbose_events_enabled() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CreditOracle);
+        let client = CreditOracleClient::new(&env, &contract_id);
 
-        let (event_contract_id, topics, data) = events.get(0).unwrap();
+        let admin = Address::generate(&env);
+        let subject = Address::generate(&env);
+        client.initialize(&admin);
+        client.set_verbose_events(&admin, &true);
 
-        // Verify the event was emitted by this contract
-        assert_eq!(event_contract_id, contract_id, "event contract id mismatch");
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::VcCount(subject.clone()), &2u32);
+            env.storage().persistent().set(
+                &DataKey::TxStats(subject.clone()),
+                &TxStats {
+                    volume_30d: 2_000_000_000,
+                    tx_count_30d: 0,
+                    avg_counterparties: 10,
+                },
+            );
+            env.storage().persistent().set(
+                &DataKey::RepaymentRecord(subject.clone()),
+                &RepaymentRecord {
+                    on_time_count: 8,
+                    total_count: 10,
+                    total_repaid: 2_000_000_000,
+                },
+            );
+        });
 
-        // Verify the topic is Symbol("Score") — decode Val back to Symbol for comparison
-        assert_eq!(topics.len(), 1, "expected 1 topic element");
-        let topic_val = topics.get(0).unwrap();
-        let topic_sym: Symbol = topic_val
-            .try_into_val(&env)
-            .expect("topic should be a Symbol");
-        assert_eq!(topic_sym, symbol_short!("Score"), "expected Score topic");
+        let score = client.compute_score(&subject);
+        assert_eq!(score, 503);
+        assert_score_event(&env, &contract_id, &subject, score);
+        assert_score_detail_event(
+            &env,
+            &contract_id,
+            &subject,
+            40,
+            22,
+            50,
+            37,
+            ScoringWeights {
+                vc_weight: 40,
+                tx_weight: 30,
+                repayment_weight: 30,
+            },
+        );
+    }
 
-        // Verify the data payload is (subject, score) — decode Val back to typed tuple
-        let (event_subject, event_score): (Address, u32) = data
-            .try_into_val(&env)
-            .expect("data should be (Address, u32)");
-        assert_eq!(event_subject, subject, "event subject mismatch");
-        assert_eq!(event_score, score, "event score mismatch");
+    #[test]
+    fn test_compute_score_stops_emitting_detail_when_disabled() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CreditOracle);
+        let client = CreditOracleClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let enabled_subject = Address::generate(&env);
+        let disabled_subject = Address::generate(&env);
+        client.initialize(&admin);
+        client.set_verbose_events(&admin, &true);
+
+        let enabled_score = client.compute_score(&enabled_subject);
+        assert_score_event(&env, &contract_id, &enabled_subject, enabled_score);
+        assert_score_detail_event(
+            &env,
+            &contract_id,
+            &enabled_subject,
+            0,
+            0,
+            0,
+            0,
+            ScoringWeights {
+                vc_weight: 40,
+                tx_weight: 30,
+                repayment_weight: 30,
+            },
+        );
+
+        env.events().all();
+        client.set_verbose_events(&admin, &false);
+
+        let disabled_score = client.compute_score(&disabled_subject);
+        assert_score_event(&env, &contract_id, &disabled_subject, disabled_score);
+        assert_eq!(count_events(&env, &contract_id, "ScoreDetail"), 0);
+    }
+
+    #[test]
+    fn test_set_verbose_events_rejects_unauthorized_account() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CreditOracle);
+        let client = CreditOracleClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let unauthorized = Address::generate(&env);
+        client.initialize(&admin);
+
+        let result = client.try_set_verbose_events(&unauthorized, &true);
+        assert_eq!(result, Err(Ok(CreditOracleError::NotAuthorized)));
+        assert!(!client.get_verbose_events());
+    }
+
+    #[test]
+    fn test_verbose_events_getter_defaults_and_tracks_configuration() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CreditOracle);
+        let client = CreditOracleClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+        assert!(!client.get_verbose_events());
+
+        client.set_verbose_events(&admin, &true);
+        assert!(client.get_verbose_events());
+        client.set_verbose_events(&admin, &false);
+        assert!(!client.get_verbose_events());
     }
 
     #[test]
